@@ -1,3 +1,5 @@
 transformers
 gradio
 torch
+spacy
+matplotlib
