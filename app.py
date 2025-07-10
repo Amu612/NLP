@@ -1,122 +1,138 @@
 import gradio as gr
 from transformers import pipeline
-import torch
 from diffusers import StableDiffusionPipeline
-import spacy
+import torch
+import networkx as nx
 import matplotlib.pyplot as plt
-from collections import Counter
-import random
 
-# Load Hugging Face Pipelines
+# ==================== Load Models ====================
 classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-fill_mask = pipeline("fill-mask", model="bert-base-uncased")
-ner_model = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
 
-# Load spaCy model
-nlp = spacy.load("en_core_web_sm")
-
-# Load Stable Diffusion model
-pipe = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+# Stable Diffusion
+image_gen = StableDiffusionPipeline.from_pretrained(
+    "CompVis/stable-diffusion-v1-4",
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    revision="fp16" if torch.cuda.is_available() else None
 ).to("cuda" if torch.cuda.is_available() else "cpu")
 
-# Environment categories
-labels = [
-    "Winter", "Summer", "Autumn", "Spring",
-    "Land", "Water", "Fire", "Air",
-    "Desert", "Forest", "Ocean", "Mountain"
+# NER and Fill-mask
+ner_pipe = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
+fill_mask = pipeline("fill-mask", model="bert-base-uncased")
+
+# ==================== Custom Utilities ====================
+
+# Environmental keywords for filter
+env_keywords = [
+    "pollution", "waste", "climate", "plastic", "ocean", "recycle",
+    "recycling", "deforestation", "conservation", "emissions", "toxins",
+    "greenhouse", "eco", "water", "air", "global", "carbon", "fuel"
 ]
 
-# Environmental keywords for spaCy + NER graph
-environment_keywords = [
-    "forest", "desert", "mountain", "river", "ocean", "sea", "beach",
-    "climate", "wildlife", "lake", "earthquake", "volcano", "storm",
-    "snow", "rain", "sun", "summer", "winter", "spring", "autumn",
-    "land", "air", "fire", "water", "hurricane", "drought", "flood"
-]
+# Color mapping for HighlightedText
+highlight_colors = {
+    "ORG": "lightblue",
+    "LOC": "lightgreen",
+    "POLLUTION": "lightcoral",
+    "THRESHOLD": "orange"
+}
 
-# 1. Classification
-def classify_environment(text):
-    result = classifier(text, candidate_labels=labels)
-    top_label = result["labels"][0]
-    score = round(result["scores"][0], 4)
-    return top_label, score
+# ==================== Functions ====================
 
-# 2. Image Generation
+def classify_sentence(text):
+    labels = ["detect water leakage", "waste management", "climate change", "recycling", "air pollution"]
+    result = classifier(text, labels)
+    return dict(zip(result['labels'], map(lambda x: round(x, 3), result['scores'])))
+
 def generate_image(prompt):
-    image = pipe(prompt).images[0]
-    return image
+    result = image_gen(prompt)
+    return result.images[0]
 
-# 3. Named Entity Recognition + Graph
-def extract_and_plot_entities(text):
-    doc = nlp(text)
-    all_entities = [ent.text.lower() for ent in doc.ents]
-    filtered_entities = [ent for ent in all_entities if any(word in ent for word in environment_keywords)]
+def custom_ner_highlight(text):
+    ents = ner_pipe(text)
+    spans = []
 
-    if not filtered_entities:
-        return "No environment-related entities found.", None
+    for ent in ents:
+        word = ent['word']
+        label = ent['entity_group']
 
-    counts = Counter(filtered_entities)
-    labels_, values = zip(*counts.items())
-    colors = [f"#{random.randint(0, 0xFFFFFF):06x}" for _ in labels_]
+        # Custom environmental classification
+        if 'pollution' in word.lower() or 'emission' in word.lower():
+            label = 'POLLUTION'
+        elif 'limit' in word.lower():
+            label = 'THRESHOLD'
+        elif word.lower() in ['who', 'unesco', 'greenpeace']:
+            label = 'ORG'
+        elif word.lower() in ['india', 'delhi', 'arctic', 'ganga', 'kanpur', 'varanasi']:
+            label = 'LOC'
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars = ax.bar(labels_, values, color=colors)
-    for bar in bars:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1, str(bar.get_height()),
-                ha='center', va='bottom', fontsize=9)
+        spans.append((word, label))
+    return spans
 
-    ax.set_title("NER Entity Distribution", fontsize=14)
-    ax.set_ylabel("Count")
-    ax.set_xlabel("Entity Type")
-    plt.xticks(rotation=45)
+def ner_graph(text):
+    entities = ner_pipe(text)
+    G = nx.Graph()
+
+    for entity in entities:
+        G.add_node(entity['word'], label=entity['entity_group'])
+
+    for i in range(len(entities) - 1):
+        G.add_edge(entities[i]['word'], entities[i + 1]['word'])
+
+    fig, ax = plt.subplots()
+    nx.draw(G, with_labels=True, node_color='lightblue', edge_color='gray',
+            node_size=1200, font_size=10, ax=ax)
     plt.tight_layout()
-    return "Entities found:", fig
+    return fig
 
-# 4. Fill-in-the-blank
-def fill_blank(text):
-    if "[MASK]" not in text:
-        return ["Please include [MASK] in your sentence to get predictions."]
-    outputs = fill_mask(text)
-    return [out["sequence"] for out in outputs]
+def fill_sentence(masked):
+    if '[MASK]' not in masked:
+        return "❗ Please include [MASK] in your sentence."
 
-# Combine all UI components
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="green", secondary_hue="blue")) as demo:
-    gr.Markdown("""
-    # 🌍 Environment-Aware AI Processor
-    **Powered by Hugging Face Models**  
-    Type text related to environment and process it through classification, NER, image generation, and more.
-    """)
+    predictions = fill_mask(masked)
 
-    with gr.Row():
-        text_input = gr.Textbox(label="Enter sentence with a blank (use [MASK] if needed)",
-                                value="My name is Will Smith. I like the Himalaya mountains. I study at GLS University. Next holidays, I will visit the [MASK] for trekking")
-        process_btn = gr.Button("🚀 Process")
+    filtered = []
+    for pred in predictions:
+        token = pred['token_str'].lower()
+        if any(env_key in token for env_key in env_keywords):
+            filtered.append(f"- {pred['sequence']}")
 
-    with gr.Accordion("Uses", open=False):
-        gr.Markdown("""
-        - `facebook/bart-large-mnli` for classification  
-        - `runwayml/stable-diffusion-v1-5` for image generation  
-        - `dslim/bert-base-NER` for NER  
-        - `bert-base-uncased` for fill-mask
-        """)
+    if not filtered:
+        return "❌ No environment-related suggestions found."
+    return "\n".join(filtered)
 
-    output1 = gr.Textbox(label="1. Category Prediction")
-    output2 = gr.Image(label="2. Generated Image")
-    output3_text = gr.Textbox(label="3. NER Summary")
-    output3_fig = gr.Plot(label="3. NER Graph")
-    output4 = gr.Textbox(label="4. Fill-in-the-Blank Output", lines=5)
 
-    def full_process(text):
-        label, score = classify_environment(text)
-        img = generate_image(label + " environment")
-        ner_text, ner_graph = extract_and_plot_entities(text)
-        fill_results = fill_blank(text)
-        return f"{label} ({score})", img, ner_text, ner_graph, "\n".join(fill_results)
+# ==================== Gradio UI ====================
 
-    process_btn.click(fn=full_process, inputs=text_input,
-                      outputs=[output1, output2, output3_text, output3_fig, output4])
+with gr.Blocks() as demo:
+    gr.Markdown("## 🌿 Environmental AI Tool — All-in-One")
+    gr.Markdown("This app uses HuggingFace models to analyze environment-related text.")
 
-if __name__ == "__main__":
-    demo.launch()
+    with gr.Tab("1️⃣ Sentence Classification"):
+        input_text = gr.Textbox(label="Enter Environmental Sentence")
+        classify_btn = gr.Button("Classify")
+        classify_out = gr.Label(label="Classification Results")
+        classify_btn.click(fn=classify_sentence, inputs=input_text, outputs=classify_out)
+
+    with gr.Tab("2️⃣ Image Generation (Stable Diffusion)"):
+        img_prompt = gr.Textbox(label="Enter Prompt (e.g., 'waste near river')")
+        img_btn = gr.Button("Generate Image")
+        image_out = gr.Image(label="Generated Image")
+        img_btn.click(fn=generate_image, inputs=img_prompt, outputs=image_out)
+
+    with gr.Tab("3️⃣ NER & Entity Graph"):
+        ner_input = gr.Textbox(label="Enter Sentence for NER")
+        ner_btn1 = gr.Button("Highlight Entities")
+        ner_btn2 = gr.Button("Generate Graph")
+        ner_out_highlight = gr.HighlightedText(label="Highlighted Entities", color_map=highlight_colors)
+        ner_out_graph = gr.Plot(label="Entity Relationship Graph")
+
+        ner_btn1.click(fn=custom_ner_highlight, inputs=ner_input, outputs=ner_out_highlight)
+        ner_btn2.click(fn=ner_graph, inputs=ner_input, outputs=ner_out_graph)
+
+    with gr.Tab("4️⃣ Fill in the Blank"):
+        mask_input = gr.Textbox(label="Sentence (use [MASK])", placeholder="e.g., Water [MASK] is harmful.")
+        mask_btn = gr.Button("Suggest Environmental Terms")
+        mask_output = gr.Textbox(label="Filtered Predictions")
+        mask_btn.click(fn=fill_sentence, inputs=mask_input, outputs=mask_output)
+
+demo.launch()
