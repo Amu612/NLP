@@ -1,5 +1,7 @@
 transformers
-gradio
 torch
+diffusers
+accelerate
+gradio
 spacy
 matplotlib
